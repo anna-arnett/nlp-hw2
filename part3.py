@@ -1,3 +1,4 @@
+
 """
 Goal: Highest-probability parse using a PCFG, with POS tags (from your BiLSTM)
       as the terminal layer.
@@ -28,31 +29,175 @@ You are free to choose your exact data structures, as long as you can:
 * After reconstruction, print the original word as the leaf instead.
 * Use log probabilities to avoid underflow:
   score = log P(A -> B C) + score(left) + score(right)
+"""
 
------------------------------------------------------------------------------
-1) READ ONE SENTENCE LINE → TOKENS → POS TAGS → DIAGONAL INIT
------------------------------------------------------------------------------
-- Read lines from train.pos as (word, tag) tuples using read_pos_files().
-- Run your BiLSTM POS tagger on the words to get one POS per token.
-  * Hint: to confirm that CKY works, first just use the true POS tags rather than running it through your tagger.
+import math
+import sys
+import collections 
 
-- Create two core tables for CKY (choose your own structures, examples below):
-    chart:   stores best scores for labels over spans
-             indexable by span (i, k) and then by label
-    backptr: stores how that best label@span was formed
-             (for terminals: the terminal tag; for binary: (left_label, split_index, right_label))
+import trees
+import utils
+import part2
 
-  Example shapes (you can pick others):
-    chart[(i, k)][label]  -> best_score (log-prob or prob)
-    backptr[(i, k)][label] -> for terminal: stored tag
-                              for binary: (left_label, j, right_label)
+def build_pcfg(train_trees_path: str):
+    part2.counts.clear()
+    with open(train_trees_path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            t = trees.Tree.from_str(s)
+            if t.root is None:
+                continue
+            part2.collect_rules_from_tree(t)
+    
+    probs = part2.compute_probs(part2.counts)
 
-- Diagonal initialization (length-1 spans [i, i+1)):
-    For each position i:
-      * Use the POS tag(s) for token i as candidate preterminals.
-      * Record best scores per POS at (i, i+1).
-      * Record backptr so reconstruction can print "(POS word)".
+    # convert to log
+    probs_log = {
+        lhs: {rhs: (math.log(p) if p > 0 else -math.inf) for rhs, p in rhs_map.items()}
+        for lhs, rhs_map in probs.items()
+    }
 
+    # index binary rules by RHS for CKY
+    cfg_by_rhs = collections.defaultdict(dict)
+    for lhs, rhs_map in probs.items():
+        for rhs, p in rhs_map.items():
+            if len(rhs) == 2 and p > 0:
+                cfg_by_rhs[rhs][lhs] = math.log(p)
+    
+    return part2.counts, probs_log, cfg_by_rhs
+
+class CKYParser:
+  def __init__(self, probs_log, cfg_by_rhs, start_symbol="TOP"):
+      self.probs_log = probs_log
+      self.cfg_by_rhs = cfg_by_rhs
+      self.start_symbol = start_symbol 
+
+        
+  def parse(self, words, pos_tags):
+    n = len(words)
+    chart = collections.defaultdict(dict)
+    backptr = collections.defaultdict(dict)
+
+    # diagonal init
+    for i in range(n):
+        tag = pos_tags[i]
+        rhs = (tag,)
+        lp = self.probs_log.get(tag, {}).get(rhs, -math.inf)
+        if lp > -math.inf:
+            chart[(i, i+1)][tag] = lp
+            backptr[(i, i+1)][tag] = ("TERM", words[i])
+    
+    for span_len in range(2, n+1):
+        for i in range(0, n-span_len+1):
+            k = i + span_len
+            _ = chart[(i, k)]
+            _ = backptr[(i, k)]
+
+            for j in range(i+1, k):
+                left_cell = chart[(i, j)]
+                right_cell = chart[(j, k)]
+                if not left_cell or not right_cell:
+                    continue 
+                
+                for L in left_cell.keys():
+                    for R in right_cell.keys():
+                        rhs = (L, R)
+                        if rhs not in self.cfg_by_rhs:
+                            continue
+                        for A, logp in self.cfg_by_rhs[rhs].items():
+                            cand = left_cell[L] + right_cell[R] + logp
+                            if A not in chart[(i, k)] or cand > chart[(i, k)][A]:
+                                chart[(i, k)][A] = cand
+                                backptr[(i, k)][A] = ("BIN", L, j, R)
+
+    def reconstruct(label, i, k):
+        bp = backptr[(i, k)][label]
+        if bp[0] == "TERM":
+            word = bp[1]
+            return f"({label} {word})"
+        else:
+            _, left_label, j, right_label = bp
+            left_tree = reconstruct(left_label, i, j)
+            right_tree = reconstruct(right_label, j, k)
+            return f"({label} {left_tree} {right_tree})"
+        
+    full_cell = chart.get((0, n), {})
+    if self.start_symbol not in full_cell:
+        return "", None # no parse
+    
+    best_logprob = full_cell[self.start_symbol]
+    tree_str = reconstruct(self.start_symbol, 0, n)
+    return tree_str, best_logprob 
+  
+
+if __name__ == "__main__":
+    counts, probs_log, cfg_by_rhs = build_pcfg("data/train.trees")
+    parser = CKYParser(probs_log, cfg_by_rhs, start_symbol="TOP")
+
+    test_sents = utils.read_pos_file("data/test.pos")
+    print("CKY with GOLD POS tags (first 10)")
+    for i, sent in enumerate(test_sents[:10], 1):
+        words = [w for (w, t) in sent]
+        tags =  [t for (w, t) in sent]
+
+        if not tags or tags[-1] != "PUNC":
+            words.append(".")
+            tags.append("PUNC")
+
+        tree_str, logp = parser.parse(words, tags)
+        if tree_str:
+            print(tree_str)
+            print(f"# logprob: {logp:.4f}")
+        else:
+            print("")
+
+    # BiLSTM
+    import torch
+    from part1 import BiLSTMTagger
+
+    ckpt = torch.load("bilstm_pos.pth", map_location="cpu")
+
+    tagger = BiLSTMTagger(data=[], embedding_dim=ckpt["embedding_dim"], hidden_dim=ckpt["hidden_dim"])
+    tagger.words = ckpt["words"]
+    tagger.tags = ckpt["tags"]
+
+    tagger.emb = torch.nn.Embedding(len(tagger.words), ckpt["embedding_dim"])
+    tagger.lstm = torch.nn.LSTM(input_size=ckpt["embedding_dim"], hidden_size=ckpt["hidden_dim"],
+                                num_layers=1, bidirectional=True, batch_first=False, dropout=0.0)
+    tagger.dropout = torch.nn.Dropout(p=0.2)
+    tagger.W_out = torch.nn.Linear(2*ckpt["hidden_dim"], len(tagger.tags))
+
+    tagger.load_state_dict(ckpt["model_state_dict"], strict=True)
+    tagger.eval()
+
+    def tag_sentence(model, words):
+        idxs = [model.words.numberize(w.lower()) for w in words]
+        x = torch.tensor(idxs, dtype=torch.long)
+        with torch.no_grad():
+            scores = model(x)
+            pred_idx = model.predict(scores).tolist()
+        return [model.tags.denumberize(j) for j in pred_idx]
+    
+    print("\nCKY with PREDICTED POS tags (first 10)")
+    for i, sent in enumerate(test_sents[:10], 1):
+        words = [w for (w, _) in sent]
+        pred_tags = tag_sentence(tagger, words)
+
+        if not pred_tags or pred_tags[-1] != "PUNC":
+            words.append(".")
+            pred_tags.append("PUNC")
+        
+        tree_str, logp = parser.parse(words, pred_tags)
+        if tree_str:
+            print(tree_str)
+            print(f"# logprob: {logp:.4f}")
+        else:
+            print("")
+  
+
+"""
 -----------------------------------------------------------------------------
 2) CKY DYNAMIC PROGRAM (THE BIG NESTED LOOP)
 -----------------------------------------------------------------------------
@@ -80,6 +225,8 @@ and split point. Conceptually:
 Notes:
   - Only binary rules are considered here (CNF).
   - Keep everything in log-space abd use addition rather than multiplication.
+"""
+"""
 
 -----------------------------------------------------------------------------
 3) ROOT SELECTION, RECONSTRUCTION, PRINTING
